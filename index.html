@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chicago Aircraft Tracker</title>
+
+<!--
+  CHANGELOG / bugfix pass - 2026-07-16
+  --------------------------------------
+  Went through and squashed a few things I noticed while testing:
+
+  1. Marker mixups: any aircraft AirLabs sent back without a hex
+     (ICAO24) code was falling through to the same "undefined" key
+     in the `markers` lookup, so two unrelated planes could end up
+     sharing/stealing one icon on the map. Now those get skipped
+     before they're ever added to `markers`. See the guard clause
+     in refreshAircraft().
+
+  2. Old comment above the setInterval() call still said "the first
+     45-second interval" - leftover from when I was testing with a
+     short refresh timer. Fixed it to just reference REFRESH_MS so it
+     doesn't go stale again next time that constant changes.
+
+  3. Popup/tooltip text was interpolating the flight's callsign and
+     squawk straight into innerHTML. Those fields come from ADS-B,
+     which is broadcast in the clear and can be spoofed with cheap
+     SDR hardware, so technically it's attacker-influenced text
+     landing in the DOM. Added escapeHtml() and wrapped both fields
+     with it before they get rendered.
+-->
+
+<!--
+  LEAFLET LIBRARY
+  ----------------
+  Leaflet is a free JavaScript library for drawing interactive maps.
+  Building a map renderer from scratch (projecting the round Earth onto
+  a flat screen, handling zoom/pan, drawing map tiles) is a LOT of work,
+  so instead we load a ready-made copy of Leaflet from a CDN (a public
+  server that hosts common libraries). No installation needed.
+-->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+<style>
+  /* ============================================================
+     LIGHT "CONTROL TOWER" THEME
+     ------------------------------------------------------------
+     Real control towers are bright glass rooms full of daylight,
+     so we go with a pale sky-blue background, white panels, and
+     a monospace font (like old teletype / radar readouts) for
+     the actual flight data. Everything else uses a normal font
+     so it stays easy to read.
+     ============================================================ */
+  :root {
+    --sky: #eaf4fb;
+    --panel: #ffffff;
+    --panel-border: #b9d6ea;
+    --ink: #1b2a38;
+    --accent: #0a6ebd;
+    --accent-dark: #084d85;
+    --ok: #1a8f4c;
+    --warn: #c0392b;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: "Segoe UI", Arial, sans-serif;
+    background: var(--sky);
+    color: var(--ink);
+  }
+
+  /* The whole page is one vertical stack: header, glossary, map, footer */
+  body {
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ---------- HEADER / BIG COUNTER ---------- */
+  header {
+    background: var(--panel);
+    border-bottom: 3px solid var(--accent);
+    padding: 14px 20px;
+    text-align: center;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+    z-index: 1000; /* stay above the map */
+  }
+
+  header h1 {
+    margin: 0;
+    font-size: 1.4rem;
+    letter-spacing: 2px;
+    color: var(--accent-dark);
+    text-transform: uppercase;
+  }
+
+  /* This is the "big counter" the brief asked for */
+  #aircraft-count {
+    font-family: "Courier New", monospace;
+    font-size: 3rem;
+    font-weight: bold;
+    color: var(--accent);
+    line-height: 1.1;
+  }
+
+  #status-line {
+    font-size: 0.8rem;
+    color: #556;
+    min-height: 1.2em; /* reserve space so layout doesn't jump */
+  }
+  #status-line.error { color: var(--warn); font-weight: bold; }
+
+  /* ---------- GLOSSARY BAR (hover tooltips) ---------- */
+  #glossary {
+    background: #dceefb;
+    border-bottom: 1px solid var(--panel-border);
+    padding: 6px 20px;
+    font-size: 0.85rem;
+    text-align: center;
+  }
+  #glossary span { margin: 0 10px; }
+
+  /* A "glossary-term" is any word with a dotted underline that
+     shows a plain-English definition when you hover over it. */
+  .glossary-term {
+    position: relative; /* anchors the tooltip box below it */
+    border-bottom: 1px dotted var(--accent-dark);
+    cursor: help;
+    font-weight: 600;
+    color: var(--accent-dark);
+  }
+
+  /* The tooltip box itself: hidden by default... */
+  .glossary-term .tooltip-box {
+    visibility: hidden;
+    opacity: 0;
+    position: absolute;
+    bottom: 125%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--ink);
+    color: #fff;
+    padding: 8px 10px;
+    border-radius: 6px;
+    width: 220px;
+    font-weight: normal;
+    font-size: 0.8rem;
+    line-height: 1.3;
+    transition: opacity 0.15s ease-in-out;
+    z-index: 2000;
+  }
+  /* ...and revealed with a smooth fade when the mouse hovers */
+  .glossary-term:hover .tooltip-box {
+    visibility: visible;
+    opacity: 1;
+  }
+
+  /* ---------- MAP ---------- */
+  #map {
+    flex: 1; /* fill all remaining vertical space */
+    width: 100%;
+  }
+
+  /* ---------- PLANE ICON ---------- */
+  /* Leaflet lets us use any HTML as a marker ("divIcon"). We use a
+     small SVG airplane. The wrapping <div> is what we rotate to
+     match each plane's heading (see rotatePlane() in the JS below). */
+  .plane-icon {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* transform-origin keeps the plane spinning around its own
+       center instead of swinging around a corner */
+    transform-origin: 50% 50%;
+  }
+  .plane-icon svg {
+    width: 100%;
+    height: 100%;
+    fill: var(--accent-dark);
+    filter: drop-shadow(0 0 1px rgba(255,255,255,0.9));
+  }
+
+  /* ---------- POPUP (per-aircraft details) ---------- */
+  .plane-popup {
+    font-size: 0.85rem;
+    line-height: 1.5;
+    font-family: "Courier New", monospace;
+  }
+  .plane-popup b {
+    display: inline-block;
+    width: 80px;
+    color: var(--accent-dark);
+    font-family: Arial, sans-serif;
+  }
+
+  /* ---------- FOOTER ---------- */
+  footer {
+    background: var(--panel);
+    border-top: 1px solid var(--panel-border);
+    text-align: center;
+    font-size: 0.75rem;
+    color: #667;
+    padding: 6px;
+  }
+  footer a { color: var(--accent-dark); }
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     HEADER: big "Aircraft Tracking" counter
+     ============================================================ -->
+<header>
+  <h1>Aircraft Tracking</h1>
+  <div id="aircraft-count">0</div>
+  <div id="status-line">Loading live data&hellip;</div>
+</header>
+
+<!-- ============================================================
+     GLOSSARY BAR: hover-to-learn definitions, as requested.
+     Each term is a <span class="glossary-term"> with a hidden
+     tooltip box that CSS reveals on hover (see the .glossary-term
+     rules in <style> above).
+     ============================================================ -->
+<div id="glossary">
+  Glossary (hover to learn):
+  <span class="glossary-term">Callsign
+    <span class="tooltip-box">
+      The name a flight uses on the radio, e.g. "UAL123." It's usually
+      the airline code plus a flight number, similar to a flight's
+      "nickname" for air traffic control.
+    </span>
+  </span>
+  <span class="glossary-term">ICAO24
+    <span class="tooltip-box">
+      A unique 24-bit ID permanently assigned to a specific physical
+      aircraft (like a car's VIN number). Unlike a callsign, this
+      never changes, even if the flight number does.
+    </span>
+  </span>
+  <span class="glossary-term">Heading
+    <span class="tooltip-box">
+      The compass direction the aircraft's nose is pointed, in degrees
+      (0&deg; = North, 90&deg; = East, 180&deg; = South, 270&deg; = West).
+      We rotate each plane icon on the map to match this.
+    </span>
+  </span>
+</div>
+
+<!-- ============================================================
+     MAP: Leaflet draws into this empty <div>. It fills whatever
+     space is left after the header/glossary/footer.
+     ============================================================ -->
+<div id="map"></div>
+
+<footer>
+  Flight data: <a href="https://airlabs.co/" target="_blank" rel="noopener">AirLabs</a>
+  &middot; Map tiles: &copy;
+  <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors
+  &middot; Auto-refreshes every hour
+</footer>
+
+<!-- Leaflet's JavaScript, from the same CDN as the CSS above -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+/* ================================================================
+   MAIN APPLICATION LOGIC
+   ================================================================
+   Everything below runs once the page loads. It:
+     1. Sets up the map, centered on Chicago.
+     2. Fetches live aircraft positions from AirLabs.
+     3. Draws/updates a rotated plane icon for each aircraft.
+     4. Repeats step 2-3 every hour.
+   ================================================================ */
+
+// ----------------------------------------------------------------
+// 1. CONFIGURATION
+// ----------------------------------------------------------------
+// A "bounding box" is just four numbers that describe a rectangle
+// on the globe: the southern edge, northern edge, western edge, and
+// eastern edge. AirLabs only sends us planes inside this rectangle,
+// which keeps the download small and fast. This box covers the
+// greater Chicago area (roughly Milwaukee down to just south of
+// Chicago, and from the Iowa border out into Michigan/Indiana).
+const BOUNDS = {
+  latMin: 40,
+  latMax: 44,
+  lonMin: -89,
+  lonMax: -86
+};
+
+// How often we re-fetch data, in milliseconds. AirLabs' free tier
+// caps out at ~1,000 requests/month, so refreshing too often burns
+// through the whole month's quota in days. Once an hour keeps this
+// well under budget (~730 requests/month) while still showing
+// reasonably current traffic for a demo/hobby site.
+const REFRESH_MS = 60 * 60 * 1000; // 1 hour
+
+// AirLabs (unlike OpenSky) grants CORS permission to any site, so no
+// proxy is needed here - this page can call it directly. The
+// tradeoff: AirLabs' only auth method is an API key placed right in
+// the URL, which means it's visible to anyone who views this page's
+// source or its browser Network tab. That's an acceptable risk at a
+// once-an-hour refresh rate, but never do this with a key tied to a
+// paid plan or anything you can't afford to have copied and reused.
+const AIRLABS_API_KEY = '21242f04-2282-4aeb-857f-d18a5a15a929';
+
+const FLIGHTS_URL =
+  `https://airlabs.co/api/v9/flights?bbox=${BOUNDS.latMin},${BOUNDS.lonMin},` +
+  `${BOUNDS.latMax},${BOUNDS.lonMax}&api_key=${AIRLABS_API_KEY}`;
+
+// ----------------------------------------------------------------
+// 2. SET UP THE MAP
+// ----------------------------------------------------------------
+// L.map(...) creates the map inside the <div id="map"> element and
+// centers it on Chicago's coordinates (latitude, longitude) at a
+// reasonable starting zoom level (higher number = more zoomed in).
+const map = L.map('map').setView([41.8781, -87.6298], 8);
+
+// Add the actual visual map imagery ("tiles"). OpenStreetMap's free
+// tile server is the standard beginner-friendly choice for Leaflet.
+// Their usage policy asks for attribution (see the <footer> above)
+// and reasonable request volume - fine for a small personal site.
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+// ----------------------------------------------------------------
+// 3. TRACK MARKERS BETWEEN REFRESHES
+// ----------------------------------------------------------------
+// We keep every aircraft's Leaflet marker in this object, keyed by
+// its ICAO24 code (that permanent per-aircraft ID from the glossary).
+// This lets us MOVE an existing plane icon on the next refresh
+// instead of deleting and recreating every single marker, which
+// would make the map flicker.
+const markers = {};
+
+// Builds the little airplane SVG used for every marker. We draw it
+// pointing "up" (north / 0 degrees) so that rotating it by an
+// aircraft's heading lines it up correctly.
+function planeIconHtml() {
+  return `
+    <div class="plane-icon">
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M12 2 L15 11 L22 14 L15 15.5 L14 22 L12 19 L10 22 L9 15.5 L2 14 L9 11 Z"/>
+      </svg>
+    </div>`;
+}
+
+// ----------------------------------------------------------------
+// 4. UNIT CONVERSIONS
+// ----------------------------------------------------------------
+// AirLabs reports altitude in meters and speed in km/h (metric
+// conventions). The brief wants feet and mph, which is what most US
+// readers expect.
+function metersToFeet(m) {
+  return m == null ? null : m * 3.28084;
+}
+function kphToMph(kph) {
+  return kph == null ? null : kph * 0.621371;
+}
+
+// Small helper: format a number nicely, or show "N/A" if AirLabs
+// didn't report a value for this aircraft (this happens often -
+// not every plane sends every field every time).
+function fmt(value, decimals = 0) {
+  return value == null || Number.isNaN(value)
+    ? 'N/A'
+    : value.toFixed(decimals);
+}
+
+// Callsign/squawk come from live ADS-B broadcasts, which anyone with
+// a cheap radio transmitter can spoof - so we treat them as untrusted
+// text and escape them before putting them in innerHTML/tooltips.
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+// ----------------------------------------------------------------
+// 5. FETCH DATA AND UPDATE THE MAP
+// ----------------------------------------------------------------
+async function refreshAircraft() {
+  const statusEl = document.getElementById('status-line');
+  const countEl = document.getElementById('aircraft-count');
+
+  try {
+    statusEl.textContent = 'Refreshing…';
+    statusEl.classList.remove('error');
+
+    // fetch() asks the browser to download the URL. "await" pauses
+    // this function until the response arrives, without freezing
+    // the rest of the page.
+    const response = await fetch(FLIGHTS_URL);
+
+    if (!response.ok) {
+      // AirLabs returns non-200 status codes (e.g. 429) when you're
+      // being rate-limited or the service is briefly overloaded.
+      throw new Error(`AirLabs returned HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (data.error) {
+      // AirLabs reports problems (bad/missing API key, quota
+      // exceeded, etc.) as a 200 response with an "error" field
+      // instead of a non-200 status code.
+      throw new Error(data.error.message || 'AirLabs API error');
+    }
+
+    // AirLabs normally returns a plain array of flight objects, each
+    // with named fields (unlike OpenSky's positional arrays).
+    const flights = Array.isArray(data) ? data : (data.response || []);
+
+    // Keep track of which ICAO24 codes we saw this round, so we can
+    // remove markers for planes that have left the bounding box.
+    const seenThisRound = new Set();
+
+    flights.forEach(flight => {
+      const icao24    = flight.hex;
+      const callsign  = flight.flight_iata || flight.flight_icao || flight.flight_number || 'N/A';
+      const longitude = flight.lng;
+      const latitude  = flight.lat;
+      const altitudeM = flight.alt;   // meters
+      const speedKph  = flight.speed; // km/h
+      const heading   = flight.dir;   // true track, degrees (0 = North)
+      const squawk    = flight.squawk || 'N/A';
+
+      // Skip aircraft with no position, or that aren't actually
+      // airborne right now - we only care about planes in the air
+      // for this tracker. Also bail if there's no icao24: caught a
+      // bug where a couple of planes without a hex code were both
+      // getting keyed as "undefined" in `markers` and stomping on
+      // each other's marker every refresh.
+      if (!icao24 || latitude == null || longitude == null || flight.status !== 'en-route') {
+        return;
+      }
+
+      seenThisRound.add(icao24);
+
+      const altitudeFt = metersToFeet(altitudeM);
+      const speedMph = kphToMph(speedKph);
+      const headingDeg = heading == null ? 0 : heading;
+      const safeCallsign = escapeHtml(callsign);
+
+      // Text shown when you click a plane icon.
+      const popupHtml = `
+        <div class="plane-popup">
+          <div><b>Flight</b> ${safeCallsign}</div>
+          <div><b>Squawk</b> ${escapeHtml(squawk)}</div>
+          <div><b>Altitude</b> ${fmt(altitudeFt)} ft</div>
+          <div><b>Speed</b> ${fmt(speedMph)} mph</div>
+        </div>`;
+
+      if (markers[icao24]) {
+        // We've seen this plane before: just move its icon and
+        // update its rotation/popup instead of creating a new one.
+        const marker = markers[icao24];
+        marker.setLatLng([latitude, longitude]);
+        marker.setPopupContent(popupHtml);
+        rotatePlane(marker, headingDeg);
+      } else {
+        // First time we've seen this plane: create a fresh marker.
+        const icon = L.divIcon({
+          className: '', // clears Leaflet's default icon styling
+          html: planeIconHtml(),
+          iconSize: [28, 28],
+          iconAnchor: [14, 14] // rotate/position around the icon's center
+        });
+
+        const marker = L.marker([latitude, longitude], { icon })
+          .addTo(map)
+          .bindPopup(popupHtml)
+          .bindTooltip(safeCallsign, { direction: 'top', offset: [0, -14] });
+
+        rotatePlane(marker, headingDeg);
+        markers[icao24] = marker;
+      }
+    });
+
+    // Remove markers for any aircraft that flew out of the box
+    // (or stopped transmitting) since the last refresh.
+    Object.keys(markers).forEach(icao24 => {
+      if (!seenThisRound.has(icao24)) {
+        map.removeLayer(markers[icao24]);
+        delete markers[icao24];
+      }
+    });
+
+    countEl.textContent = seenThisRound.size;
+    statusEl.textContent =
+      `Last updated ${new Date().toLocaleTimeString()} — next refresh in ${REFRESH_MS / 1000}s`;
+
+  } catch (err) {
+    // If AirLabs is down, rate-limiting us, or the network hiccups,
+    // we show a friendly message instead of silently failing or
+    // crashing the page. Old markers stay on screen until the next
+    // successful refresh.
+    console.error('Failed to refresh aircraft data:', err);
+    statusEl.textContent = 'Could not reach AirLabs (will retry). ' + err.message;
+    statusEl.classList.add('error');
+  }
+}
+
+// Rotates a marker's icon <div> to match the aircraft's heading.
+// We reach into the marker's rendered DOM element and apply a CSS
+// "transform: rotate()" - Leaflet doesn't have a built-in rotation
+// option for divIcons, so this is the standard workaround.
+function rotatePlane(marker, headingDeg) {
+  const el = marker.getElement();
+  if (!el) return; // element may not exist yet on the very first paint
+  const inner = el.querySelector('.plane-icon');
+  if (inner) {
+    inner.style.transform = `rotate(${headingDeg}deg)`;
+  }
+}
+
+// ----------------------------------------------------------------
+// 6. KICK THINGS OFF
+// ----------------------------------------------------------------
+// Run once immediately so the map isn't empty while we wait for the
+// first REFRESH_MS interval to elapse, then keep repeating forever.
+refreshAircraft();
+setInterval(refreshAircraft, REFRESH_MS);
+
+</script>
+</body>
+</html>
