@@ -6,7 +6,7 @@ a hover glossary for anyone who isn't familiar with aviation terms like
 "squawk" or "ICAO24."
 
 Built mostly as a way to get hands-on with mapping libraries and a live public
-API outside of my usual analytics/BI stack.
+API outside of my usual analytics/BI stack. It can be accessed here: https://stasnim99.github.io/Flight-Tracker/
 
 ## Features
 
