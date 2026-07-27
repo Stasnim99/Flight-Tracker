@@ -8,7 +8,7 @@ a hover glossary for anyone who isn't familiar with aviation terms like
 Built mostly as a way to get hands-on with mapping libraries and a live public
 API outside of my usual analytics/BI stack. It can be accessed here: https://stasnim99.github.io/Flight-Tracker/
 
-## Features
+## Features 
 
 - Live aircraft positions plotted on an interactive map (pan/zoom supported)
 - Plane icons rotate to match each aircraft's actual heading
