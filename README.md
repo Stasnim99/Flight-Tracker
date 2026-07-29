@@ -17,6 +17,8 @@ API outside of my usual analytics/BI stack. It can be accessed here: https://sta
 - Auto-refreshes every hour
 
 - <img width="2432" height="1565" alt="Screenshot 2026-07-29 094935" src="https://github.com/user-attachments/assets/b8713815-1c40-4836-87e8-9dde01025f61" />
+<img width="506" height="334" alt="Screenshot 2026-07-29 094748" src="https://github.com/user-attachments/assets/00f09e5a-4f9b-45aa-b1e9-047a6688369f" />
+
 
 
 ## Tech
@@ -25,6 +27,8 @@ API outside of my usual analytics/BI stack. It can be accessed here: https://sta
 - [OpenStreetMap](https://www.openstreetmap.org/) tiles
 - [AirLabs](https://airlabs.co/) for live flight data
 - Plain HTML/CSS/JS - no build step, no framework
+<img width="1051" height="324" alt="Screenshot 2026-07-29 094733" src="https://github.com/user-attachments/assets/0c5c6746-2975-4e0a-bfa0-aa6c015d1258" />
+
 
 ## Running it locally
 
