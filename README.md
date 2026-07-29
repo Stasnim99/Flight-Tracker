@@ -16,6 +16,9 @@ API outside of my usual analytics/BI stack. It can be accessed here: https://sta
 - Hover glossary explaining callsign / ICAO24 / heading in plain English
 - Auto-refreshes every hour
 
+- <img width="2432" height="1565" alt="Screenshot 2026-07-29 094935" src="https://github.com/user-attachments/assets/b8713815-1c40-4836-87e8-9dde01025f61" />
+
+
 ## Tech
 
 - [Leaflet](https://leafletjs.com/) for the map itself
